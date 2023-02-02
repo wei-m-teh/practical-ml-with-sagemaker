@@ -53,7 +53,7 @@ Daily user logs describing listening behaviors of a user.
 ## Assumption
 All the codes and jupyter notebooks are validated and tested only SageMaker Studio notebooks.
 
-## Project Organization and Orientation
+## Start Here
 This project is delivered via both jupyter notebooks and python scripts. We recommend you begin explore the project in this order
 
 1. [EMR Integration Using Sagemaker Studio Notebook](processing_pyspark.ipynb) is a notebook that performs EDA and feature engineering for the given dataset. The notebook uses an extension for SageMaker Studio kernel (SparkMagic) to enable live connection to an EMR cluster to perform the analysis. In order for this notebook to work in your environment, make sure you have access to an EMR cluster (could be done from within SageMaker Studio) from your Studio environment. The extension that enables the EMR connection is as followed:
@@ -65,4 +65,12 @@ This project is delivered via both jupyter notebooks and python scripts. We reco
 
 Additionally, since the notebook make use of matplotlib and pandas, the EMR cluster was also provisioned to bootstrap these dependencies. The bootstrap script can be found under the emr/ folder in this repository. Please refer to [this](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-plan-bootstrap.html) documentation for information on how to use bootstrap action to install additional software on an EMR cluster, 
 
+2. [End to end solution notebook](sagemaker_end_to_end.ipynb). This notebook contains an end to end solution that covers from data ingestion to model serving inference.  The processes involved in the implementation are: 
 
+* Ingest features into SageMaker Feature Store, 
+* Run model training with SageMaker Experiment and Debugger
+* Use Automatic Hyperparameter optimization tuner from SageMaker to identify the most optimized parameters
+* Run Bias and Explainability analysis on the data and the best model
+* Register the model with SageMaker Model Registry
+* Deploy the model to a real-time SageMaker inference endpoint
+* Test the endpoint
