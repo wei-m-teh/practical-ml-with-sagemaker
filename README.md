@@ -66,7 +66,6 @@ This project is delivered via both jupyter notebooks and python scripts. We reco
 **Note:** Additionally, since the notebook make use of matplotlib and pandas, the EMR cluster was also provisioned to bootstrap these dependencies. The bootstrap script can be found under the emr/ folder in this repository. Please refer to [this](https://docs.aws.amazon.com/emr/latest/ManagementGuide/emr-plan-bootstrap.html) documentation for information on how to use bootstrap action to install additional software on an EMR cluster, 
 
 2. [End to end solution notebook](sagemaker_end_to_end.ipynb). This notebook contains an end to end solution that covers from data ingestion to model serving inference.  The processes involved in the implementation are: 
-<br>
     * Ingest features into SageMaker Feature Store, 
     * Run model training with SageMaker Experiment and Debugger
     * Use Automatic Hyperparameter optimization tuner from SageMaker to identify the most optimized parameters
@@ -74,4 +73,3 @@ This project is delivered via both jupyter notebooks and python scripts. We reco
     * Register the model with SageMaker Model Registry
     * Deploy the model to a real-time SageMaker inference endpoint
     * Test the endpoint
-</br>
