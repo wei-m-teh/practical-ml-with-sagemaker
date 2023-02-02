@@ -50,11 +50,14 @@ Daily user logs describing listening behaviors of a user.
 * num_unq: # of unique songs played
 * total_secs: total seconds played
 
-## Assumption
-All the codes and jupyter notebooks are validated and tested only SageMaker Studio notebooks.
+## Assumptions
+* All the codes and jupyter notebooks are validated and tested only SageMaker Studio notebooks.
+* This project uses Amazon CodePipeline to orchestrates the CICD for the project.
 
 ## Start Here
-This project is delivered via both jupyter notebooks and python scripts. We recommend you begin explore the project in this order
+Overall workflow
+
+![sagemaker pipeline](img/sagemakerpipeline-churn.png)
 
 1. [EMR Integration Using Sagemaker Studio Notebook](processing_pyspark.ipynb) is a notebook that performs EDA and feature engineering for the given dataset. The notebook uses an extension for SageMaker Studio kernel (SparkMagic) to enable live connection to an EMR cluster to perform the analysis. In order for this notebook to work in your environment, make sure you have access to an EMR cluster (could be done from within SageMaker Studio) from your Studio environment. The extension that enables the EMR connection is as followed:
 
@@ -73,3 +76,6 @@ This project is delivered via both jupyter notebooks and python scripts. We reco
     * Register the model with SageMaker Model Registry
     * Deploy the model to a real-time SageMaker inference endpoint
     * Test the endpoint
+    
+3. [SageMaker Pipeline](sagemaker-pipeline.ipynb). This notebook adopts SageMaker Pipeline to define steps similar those implemented in the [notebook](sagemaker_end_to_end.ipynb) above. 
+
