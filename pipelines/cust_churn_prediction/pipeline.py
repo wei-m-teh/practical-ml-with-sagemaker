@@ -1,4 +1,4 @@
-"""Example workflow pipeline script for abalone pipeline.
+"""Example workflow pipeline script for customer churn prediction pipeline.
                                                                                  . -ModelStep
                                                                                 .
     Process-> DataQualityCheck/DataBiasCheck -> Train -> Evaluate -> Condition .
@@ -63,6 +63,8 @@ from sagemaker.workflow.conditions import ConditionGreaterThan
 from sagemaker.workflow.condition_step import ConditionStep
 from sagemaker.workflow.functions import JsonGet
 from sagemaker.workflow.pipeline import Pipeline
+from sagemaker.model_metrics import MetricsSource, ModelMetrics, FileSource
+from sagemaker.drift_check_baselines import DriftCheckBaselines
 
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -158,13 +160,13 @@ def get_pipeline(
     Returns:
         an instance of a pipeline
     """
-    
     s3_client = boto3.resource('s3')
     pipeline_name = f"StreamingServiceChurnModelPipeline"
     sagemaker_session = sagemaker.session.Session()
     region = sagemaker_session.boto_region_name
-    role = sagemaker.get_execution_role()
+    pipeline_session = PipelineSession()
     default_bucket = sagemaker_session.default_bucket()
+
     model_package_group_name = f"StreamingServiceModelPackageGroup"
     s3_processing_input_prefix = "data/kkbox-customer-churn-model/raw"
     s3_code_prefix = "data/kkbox-customer-churn-model/code"
@@ -216,13 +218,17 @@ def get_pipeline(
     # Upload processing script to S3
     s3_client.Bucket(default_bucket).upload_file(f"{BASE_DIR}/preprocess.py", f"{s3_code_prefix}/preprocess.py")
     
-    # Run the processing job
+    # PreProcessing Step
+    # In this step, we'll use a Pyspark SageMaker processing job to perform the feature engineering functionality. 
+    # SageMaker Processing job will use an ephimeral cluster to run the given pyspark script and automatically 
+    # shutsdown when the script complete.
+    
     spark_processor = PySparkProcessor(
         base_job_name="sm-spark",
         framework_version="3.1",
         role=role,
-        instance_count=pyspark_cluster_instance_count,
-        instance_type=pyspark_cluster_instance_type,
+        instance_count=processing_instance_count,
+        instance_type=processing_instance_type,
         max_runtime_in_seconds=12000,
         sagemaker_session = pipeline_session
     )
@@ -253,11 +259,12 @@ def get_pipeline(
     # The `DataQualityCheckConfig` is used to define the Quality Check job by specifying the dataset used to calculate
     # the baseline, in this case, the training dataset from the data processing step, the dataset format, in this case,
     # a csv file with no headers, and the output path for the results of the data quality check.
+    
     s3 = boto3.client("s3")
     response = s3.list_objects_v2(Bucket=default_bucket, Prefix=s3_preprocessing_output_prefix)
     train_data_s3_uri_prefix = [ x['Key'] for x in response['Contents'] if f"{s3_preprocessing_output_prefix}/train" in x['Key']][0]
-    train_data_s3_uri = os.path.join(f"s3://{default_bucket}", train_data_s3_uri_prefix)
-    
+    train_data_s3_uri = os.path.join(f"s3://{default_bucket}", train_data_s3_uri_prefix)    
+
     check_job_config = CheckJobConfig(
         role=role,
         instance_count=1,
@@ -290,9 +297,9 @@ def get_pipeline(
         supplied_baseline_statistics=supplied_baseline_statistics_data_quality,
         supplied_baseline_constraints=supplied_baseline_constraints_data_quality,
         model_package_group_name=model_package_group_name,
-        cache_config=cache_config
+        cache_config=cache_config,
+        depends_on=[step_process]
     )
-    data_quality_check_step.add_depends_on([step_process])
 
     #### Calculating the Data Bias
 
@@ -351,10 +358,10 @@ def get_pipeline(
         register_new_baseline=register_new_baseline_data_bias,
         supplied_baseline_constraints=supplied_baseline_constraints_data_bias,
         model_package_group_name=model_package_group_name,
-        cache_config=cache_config
+        cache_config=cache_config,
+        depends_on=[data_quality_check_step]
     )
-
-    data_bias_check_step.add_depends_on([data_quality_check_step])
+    model_path = f"s3://{default_bucket}/{s3_model_prefix}"
 
     model_path = f"s3://{default_bucket}/{s3_model_prefix}"
 
@@ -369,7 +376,7 @@ def get_pipeline(
         "sm_experiment" : ExecutionVariables.PIPELINE_NAME,
         "sm_run" : ExecutionVariables.PIPELINE_EXECUTION_ID}
 
-    xgb_train = XGBoost(entry_point = f"{BASE_DIR}/train.py", 
+    xgb_train = XGBoost(entry_point = "pipelines/cust_churn_prediction/train.py", 
                         framework_version='1.5-1',
                         hyperparameters=hyperparameters,
                         role=role,
@@ -395,35 +402,21 @@ def get_pipeline(
     step_train = TrainingStep(
         name="TrainModel",
         step_args=train_args,
-        cache_config=cache_config)
+        cache_config=cache_config,
+        depends_on=[step_process])
 
-    # step_train.add_depends_on([data_bias_check_step])
-    step_train.add_depends_on([step_process])
     
     model = XGBoostModel(
         model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
         sagemaker_session=pipeline_session,
         role=role,
-        entry_point=f"{BASE_DIR}/inference.py",
+        entry_point="pipelines/cust_churn_prediction/inference.py",
         framework_version="1.5-1"
     )
     step_create_model = ModelStep(
         name="CreateModel",
         step_args=model.create(instance_type=inference_instance_type),
     )
-
-    transformer = Transformer(
-        model_name=step_create_model.properties.ModelName,
-        instance_type="ml.m5.xlarge",
-        instance_count=1,
-        accept="text/csv",
-        assemble_with="Line",
-        output_path=f"s3://{default_bucket}/AbaloneTransform",
-        sagemaker_session=pipeline_session,
-    )
-
-    # The output of the transform step combines the prediction and the input label.
-    # The output format is `prediction, original label`
 
     model_client_config = { "InvocationsTimeoutInSeconds" : 10, "InvocationsMaxRetries" : 3 }
 
@@ -448,9 +441,9 @@ def get_pipeline(
             split_type="Line",
             model_client_config = model_client_config
         ),
-        cache_config=cache_config
+        cache_config=cache_config,
+        depends_on=[step_train]
     )
-
     ### Check the Model Quality
 
     # In this `QualityCheckStep` we calculate the baselines for statistics and constraints using the
@@ -486,15 +479,14 @@ def get_pipeline(
         supplied_baseline_statistics=supplied_baseline_statistics_model_quality,
         supplied_baseline_constraints=supplied_baseline_constraints_model_quality,
         model_package_group_name=model_package_group_name,
-        cache_config=cache_config
+        cache_config=cache_config,
+        depends_on = [step_transform]
     )
-
     ### Check for Model Bias
 
     # Similar to the Data Bias check step, a `BiasConfig` is defined and Clarify is used to calculate
     # the model bias using the training dataset and the model.
-
-
+    
     model_bias_analysis_cfg_output_path = (
         f"s3://{default_bucket}/{s3_bias_prefx}/modelbiascheckstep/analysis_cfg"
     )
@@ -518,13 +510,12 @@ def get_pipeline(
     )
 
     model_config = ModelConfig(
-        # model_name=step_create_model.properties.ModelName,
-        model_name="pipelines-qc3a28gjs7gy-CreateModel-CreateMo-ySeT9JP7In",
+        model_name=step_create_model.properties.ModelName,
         instance_count=1,
         instance_type="ml.m5.xlarge",
     )
 
-    # We are using this bias config to configure Clarify to detect bias based on the first feature in the featurized vector for Gender
+    # We are using this bias config to configure Clarify to detect bias based on the first feature in the featurized vector for Sex
     model_bias_config = BiasConfig(label_values_or_threshold=[1], facet_name=[16], facet_values_or_threshold=[[1]])
 
     model_bias_check_config = ModelBiasCheckConfig(
@@ -542,8 +533,10 @@ def get_pipeline(
         register_new_baseline=register_new_baseline_model_bias,
         supplied_baseline_constraints=supplied_baseline_constraints_model_bias,
         model_package_group_name=model_package_group_name,
-        cache_config=cache_config
-    )
+        cache_config=cache_config,
+        depends_on=[model_quality_check_step]
+    )    
+    
     ### Check Model Explainability
 
     # SageMaker Clarify uses a model-agnostic feature attribution approach, which you can used to understand
@@ -560,7 +553,7 @@ def get_pipeline(
     )
 
     model_explainability_data_config = DataConfig(
-        s3_data_input_path=f"s3://{default_bucket}/{s3_preprocessing_output_prefix}/test",
+        s3_data_input_path=f"s3://{default_bucket}/{s3_preprocessing_output_prefix}/validation",
         s3_output_path=Join(
             on="/",
             values=[
@@ -590,12 +583,13 @@ def get_pipeline(
         register_new_baseline=register_new_baseline_model_explainability,
         supplied_baseline_constraints=supplied_baseline_constraints_model_explainability,
         model_package_group_name=model_package_group_name,
-        cache_config=cache_config
+        cache_config=cache_config,
+        depends_on=[model_bias_check_step]
     )
-
-    #Upload the evaluation script to S3
-    s3_client.Bucket(default_bucket).upload_file(f"{BASE_DIR}/evaluate.py", f"{s3_code_prefix}/evaluate.py")
     
+    #Upload the evaluation script to S3
+    s3_client.Bucket(default_bucket).upload_file("pipelines/cust_churn_prediction/evaluate.py", f"{s3_code_prefix}/evaluate.py")
+
     image_uri = sagemaker.image_uris.retrieve(
         framework="xgboost",
         region=region,
@@ -618,11 +612,9 @@ def get_pipeline(
         inputs=[
             ProcessingInput(
                 source=step_train.properties.ModelArtifacts.S3ModelArtifacts,
-                # source="s3://sagemaker-us-east-1-602900100639/data/kkbox-customer-churn-model/output/pipelines-qc3a28gjs7gy-TrainModel-0PGCjWGNiz/output/model.tar.gz",
                 destination="/opt/ml/processing/model",
             ),
             ProcessingInput(
-                # source=step_process.properties.ProcessingOutputConfig.Outputs["test"].S3Output.S3Uri,
                 source=f"s3://{default_bucket}/{s3_preprocessing_output_prefix}/validation",
                 destination="/opt/ml/processing/validation",
             ),
@@ -641,8 +633,81 @@ def get_pipeline(
         name="EvaluateModel",
         step_args=eval_args,
         property_files=[evaluation_report],
+        depends_on=[step_create_model]
+    ) 
+    
+    # Model Metrics
+    # Define the metrics to be registered with the model in the Model Registry
+    
+    model_metrics = ModelMetrics(
+        model_data_statistics=MetricsSource(
+            s3_uri=data_quality_check_step.properties.CalculatedBaselineStatistics,
+            content_type="application/json",
+        ),
+        model_data_constraints=MetricsSource(
+            s3_uri=data_quality_check_step.properties.CalculatedBaselineConstraints,
+            content_type="application/json",
+        ),
+        bias_pre_training=MetricsSource(
+            s3_uri=data_bias_check_step.properties.CalculatedBaselineConstraints,
+            content_type="application/json",
+        ),
+        model_statistics=MetricsSource(
+            s3_uri=model_quality_check_step.properties.CalculatedBaselineStatistics,
+            content_type="application/json",
+        ),
+        model_constraints=MetricsSource(
+            s3_uri=model_quality_check_step.properties.CalculatedBaselineConstraints,
+            content_type="application/json",
+        ),
+        bias_post_training=MetricsSource(
+            s3_uri=model_bias_check_step.properties.CalculatedBaselineConstraints,
+            content_type="application/json",
+        ),
+        explainability=MetricsSource(
+            s3_uri=model_explainability_check_step.properties.CalculatedBaselineConstraints,
+            content_type="application/json",
+        ),
     )
-    step_eval.add_depends_on([step_create_model])
+
+    drift_check_baselines = DriftCheckBaselines(
+        model_data_statistics=MetricsSource(
+            s3_uri=data_quality_check_step.properties.BaselineUsedForDriftCheckStatistics,
+            content_type="application/json",
+        ),
+        model_data_constraints=MetricsSource(
+            s3_uri=data_quality_check_step.properties.BaselineUsedForDriftCheckConstraints,
+            content_type="application/json",
+        ),
+        bias_pre_training_constraints=MetricsSource(
+            s3_uri=data_bias_check_step.properties.BaselineUsedForDriftCheckConstraints,
+            content_type="application/json",
+        ),
+        bias_config_file=FileSource(
+            s3_uri=model_bias_check_config.monitoring_analysis_config_uri,
+            content_type="application/json",
+        ),
+        model_statistics=MetricsSource(
+            s3_uri=model_quality_check_step.properties.BaselineUsedForDriftCheckStatistics,
+            content_type="application/json",
+        ),
+        model_constraints=MetricsSource(
+            s3_uri=model_quality_check_step.properties.BaselineUsedForDriftCheckConstraints,
+            content_type="application/json",
+        ),
+        bias_post_training_constraints=MetricsSource(
+            s3_uri=model_bias_check_step.properties.BaselineUsedForDriftCheckConstraints,
+            content_type="application/json",
+        ),
+        explainability_constraints=MetricsSource(
+            s3_uri=model_explainability_check_step.properties.BaselineUsedForDriftCheckConstraints,
+            content_type="application/json",
+        ),
+        explainability_config_file=FileSource(
+            s3_uri=model_explainability_check_config.monitoring_analysis_config_uri,
+            content_type="application/json",
+        ),
+    )
     
     ### Register the model
 
@@ -663,14 +728,6 @@ def get_pipeline(
     # the newly calculated baselines. In some cases, users may retain an older version of the baseline file to be used
     # for drift checks and not register new baselines that are calculated in the Pipeline run.
 
-    model_metrics = ModelMetrics(
-        model_statistics=MetricsSource(
-            s3_uri="{}/evaluation.json".format(
-                step_eval.arguments["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
-            ),
-            content_type="application/json",
-        )
-    )
     register_args = model.register(
         content_types=["text/csv"],
         response_types=["text/csv"],
@@ -679,15 +736,25 @@ def get_pipeline(
         model_package_group_name=model_package_group_name,
         approval_status=model_approval_status,
         model_metrics=model_metrics,
+        drift_check_baselines=drift_check_baselines
     )
-    step_register = ModelStep(name="RegisterModel", step_args=register_args)
 
+    step_register = ModelStep(name="RegisterModel", step_args=register_args, depends_on=[model_explainability_check_step])
+
+    # Define a FailStep to stop an Amazon SageMaker Model Building Pipelines execution when a desired condition or state 
+    # is not achieved and to mark that pipeline's execution as failed. The FailStep also allows you to enter a custom error message, 
+    # indicating the cause of the pipeline's execution failure.
+    
     step_fail = FailStep(
         name="EvalScoreFail",
         error_message=Join(on=" ", values=["Execution failed due to AUC Score >", auc_score_threshold]),
     )
     
-    cond_lte = ConditionGreaterThan(
+    # Condition Check
+    # We define a condition check to determine whether to stop the pipeline execution when the evaluation scores (AUC) 
+    # did not meet the threshold specified.
+    
+    cond_gte = ConditionGreaterThan(
         left=JsonGet(
             step_name=step_eval.name,
             property_file=evaluation_report,
@@ -697,9 +764,9 @@ def get_pipeline(
     )
     step_cond = ConditionStep(
         name="CheckEvaluationScore",
-        conditions=[cond_lte],
-        if_steps=[step_register],
-        else_steps=[step_fail],
+        conditions=[cond_gte],
+        if_steps=[step_transform, model_quality_check_step, model_bias_check_step, model_explainability_check_step,step_register],
+        else_steps=[step_fail]
     )
 
     # pipeline instance
@@ -731,6 +798,14 @@ def get_pipeline(
             model_approval_status,
             auc_score_threshold,
         ],
-        steps=[step_process, step_train, step_create_model, step_eval, step_cond]
+        steps=[step_process, 
+            data_quality_check_step,
+            data_bias_check_step,
+            step_train, 
+            step_create_model,
+            step_eval, 
+            step_cond
+        ]
     ) 
+
     return pipeline

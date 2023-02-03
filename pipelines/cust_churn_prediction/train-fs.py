@@ -1,5 +1,5 @@
 import os
-os.system("pip install -U sagemaker")
+os.system("pip install -U sagemaker smdebug")
 
 import pandas as pd
 from xgboost import XGBClassifier
@@ -18,8 +18,36 @@ import numpy as np
 import boto3
 import pickle as pkl
 import glob
+from smdebug import SaveConfig
+from smdebug.xgboost import Hook
+from time import strftime, gmtime
 
 cols = ['msno', 'is_churn', 'regist_trans', 'mst_frq_plan_days', 'revenue', 'regist_cancels', 'bd', 'tenure', 'num_25', 'num_50', 'num_75', 'num_985', 'num_100', 'num_unq', 'total_secs', 'city', 'gender', 'registered_via', 'qtr_trans', 'mst_frq_pay_met', 'is_auto_renew']
+
+def create_smdebug_hook(
+    out_dir,
+    train_data=None,
+    validation_data=None,
+    frequency=1,
+    collections=None,
+):
+
+    train_data_csv = "/tmp/train.csv"
+    test_data_csv = "/tmp/test.csv"
+    
+    train_data.iloc[:, 1:].to_csv(train_data_csv, header=False, index=False)
+    validation_data.iloc[:, 1:].to_csv(test_data_csv, header=False, index=False)
+            
+    save_config = SaveConfig(save_interval=frequency)
+    hook = Hook(
+        out_dir=out_dir,
+        train_data=(train_data_csv, "csv"),
+        validation_data=(test_data_csv, "csv"),
+        save_config=save_config,
+        include_collections=collections,
+    )
+
+    return hook
 
 def train(session, args):
     train_dir = os.environ.get('SM_CHANNEL_TRAIN', "../data")
@@ -32,13 +60,33 @@ def train(session, args):
     
     train_df = pd.read_csv(f"{train_csv[0]}", names=cols)
     test_df = pd.read_csv(f"{test_csv[0]}", names=cols)
-
-    with load_run(sagemaker_session=session, experiment_name=args.sm_experiment, run_name=args.sm_run) as run:    
+    
+    run_name = None
+    if args.sm_run is not None:
+        run_name=f"{args.sm_run}-{strftime('%Y%m%d%H%M%S', gmtime())}"
+        
+    with load_run(sagemaker_session=session, experiment_name=args.sm_experiment, run_name=run_name) as run:
         x = train_df.drop(["msno"],axis=1).iloc[:, 1:]
         y = train_df.loc[:, "is_churn"]
         
         x_test = test_df.drop(["msno"],axis=1).iloc[:, 1:]
         y_test = test_df.loc[:, "is_churn"]
+        
+        # The output_uri is a the URI for the s3 bucket where the metrics will be
+        # saved.
+        output_uri = args.smdebug_path if args.smdebug_path is not None else args.output_uri
+
+        collections = (
+            args.smdebug_collections.split(",") if args.smdebug_collections is not None else None
+        )
+
+        hook = create_smdebug_hook(
+            out_dir=output_uri,
+            frequency=args.smdebug_frequency,
+            collections=collections,
+            train_data=train_df,
+            validation_data=test_df,
+        )
         
         model = XGBClassifier(objective="binary:logistic", 
                              max_depth=int(args.max_depth), 
@@ -46,21 +94,26 @@ def train(session, args):
                              gamma=int(args.gamma),
                              min_child_weight=int(args.min_child_weight),
                              subsample=float(args.subsample),
-                             n_estimators=int(args.n_estimators))
+                             n_estimators=int(args.n_estimators),
+                             callbacks=[hook])
+        
         model.fit(x,y, eval_set=[(x, y), (x_test, y_test)])
         eval_results = model.evals_result()
         train_loss_dict = eval_results['validation_0']
         train_loss_arr = train_loss_dict['logloss']
         for idx, loss in enumerate(train_loss_arr):
-            print(f"train idx: {idx}, loss: {loss}, type: {type(loss)}")
+            print(f'[{idx:03}]#011train-logloss:{loss};')
+            # print(f"train idx: {idx}, loss: {loss}, type: {type(loss)}")
             run.log_metric(name="train:logloss", value=loss, step=idx)
-        
+        # print(f"[000]#011train-logloss:{train_loss_arr[-1]};")
+    
         val_loss_dict = eval_results['validation_1']
         val_loss_arr = val_loss_dict['logloss']
         for idx, loss in enumerate(val_loss_arr):
-            print(f"val idx: {idx}, loss: {loss}")
+            # print(f"val idx: {idx}, loss: {loss}")
+            print(f'[{idx:03}]#011validation-logloss:{loss};')
             run.log_metric(name="validation:logloss", value=loss, step=idx)
-        
+        # print(f"[000]#011validation-logloss:{val_loss_arr[-1]};")
         print(f"evaluation results: {eval_results}")
         y_pred = model.predict(x_test)
         y_pred_proba=model.predict_proba(x_test)[:,1]
@@ -107,7 +160,10 @@ if __name__ == "__main__":
     parser.add_argument('--model_dir', default=os.environ.get('SM_MODEL_DIR'), help="AWS region where the training job is run")
     parser.add_argument('--sm_experiment', help="Sagemaker Experiment name associates with the training job")
     parser.add_argument('--sm_run', help="Sagemaker Experiment Trial name associates with the training job")
-        
+    parser.add_argument("--smdebug_path", type=str, default=None)
+    parser.add_argument("--smdebug_frequency", type=int, default=1)
+    parser.add_argument("--smdebug_collections", type=str, default="metrics")
+    parser.add_argument("--output_uri", type=str, default="/opt/ml/output/tensors", help="S3 URI of the bucket where tensor data will be stored.")
 
     args = parser.parse_args()
     
